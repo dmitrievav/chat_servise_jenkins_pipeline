@@ -1,0 +1,668 @@
+import org.biouno.unochoice.model.GroovyScript
+import groovy.json.*
+import java.text.SimpleDateFormat
+
+def deployParallelism = 10
+
+stage 'Build'
+def buildArtifactName = ''
+node('php5') {
+   checkout scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${RC_TO_BUILD}"]], extensions: [[$class: 'CleanBeforeCheckout'], [$class: 'CloneOption', depth: 0, noTags: false, reference: '/vagrant/shared/TML', shallow: false]], userRemoteConfigs: [[credentialsId: '26454ce6-0cdb-4dac-8de0-75195f37ddfc', url: 'https://github.com/rocket-internet-berlin/TML.git']]]
+
+   currentBuild.displayName += " (${RC_TO_BUILD})"
+
+   sh "./gradlew build"
+
+   sh "find sellercenter/build/ -name '*.tar.gz' -exec basename {} \\; > built_package.txt"
+   def oldBuildArtifactName = readFile 'built_package.txt'
+   oldBuildArtifactName = oldBuildArtifactName.trim()
+   buildArtifactName = oldBuildArtifactName.replaceAll(/-vagrant.tar\.gz$/, "-" + getDeployerUsername() + ".tar.gz").replaceAll(/^site-/, 'site-candidates-')
+
+   println "Build artifact name: ${buildArtifactName}"
+   sh "mv sellercenter/build/${oldBuildArtifactName} sellercenter/build/${buildArtifactName}"
+
+   fixupRevTxt('sellercenter/build/rev.txt', buildArtifactName, "${RC_TO_BUILD}")
+   fixupRevTxt('sellercenter/public/rev.txt', buildArtifactName, "${RC_TO_BUILD}")
+   fixupRevTxt('sellercenter/public_api/rev.txt', buildArtifactName, "${RC_TO_BUILD}")
+
+   sh "gunzip sellercenter/build/${buildArtifactName}"
+   def uncompressedBuildArtifact = buildArtifactName.replaceAll(/.gz$/, '')
+   sh "tar --delete --file=sellercenter/build/${uncompressedBuildArtifact}  sellercenter/build/rev.txt sellercenter/public/rev.txt sellercenter/public_api/rev.txt"
+   sh "tar -uf sellercenter/build/${uncompressedBuildArtifact} sellercenter/build/rev.txt sellercenter/public/rev.txt sellercenter/public_api/rev.txt"
+   sh "gzip sellercenter/build/${uncompressedBuildArtifact}"
+
+   step([$class: 'ArtifactArchiver', artifacts: "sellercenter/build/${buildArtifactName}", fingerprint: true])
+   dir('sellercenter/build') {
+     stash include: "${buildArtifactName}", name: "package"
+   }
+}
+
+stage 'QA'
+parallel(
+unitTests: {
+    node('php5') {
+        checkout scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${RC_TO_BUILD}"]], extensions: [[$class: 'CloneOption', depth: 0, noTags: false, reference: '/vagrant/shared/TML', shallow: false]], userRemoteConfigs: [[credentialsId: '26454ce6-0cdb-4dac-8de0-75195f37ddfc', url: 'https://github.com/rocket-internet-berlin/TML.git']]]
+        //sh "./gradlew unittest"
+        //step([$class: 'JUnitResultArchiver', testResults: 'sellercenter/build/logs/unit-test.xml'])
+    }
+},
+integrationTests: {
+    node('php5') {
+        checkout scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${RC_TO_BUILD}"]], extensions: [[$class: 'CloneOption', depth: 0, noTags: false, reference: '/vagrant/shared/TML', shallow: false]], userRemoteConfigs: [[credentialsId: '26454ce6-0cdb-4dac-8de0-75195f37ddfc', url: 'https://github.com/rocket-internet-berlin/TML.git']]]
+        createTemporaryDirectory()
+/*
+    def oldSedText = readFile("sellercenter/tools/gradle/sellercenter.application.ini.sed")
+    def newSedText = fixupSedFile(oldSedText, getDatabaseNameForBuild(), getShopDatabaseNameForBuild())
+    writeFile file: "sellercenter/tools/gradle/sellercenter.application.ini.sed", text: newSedText
+
+    sh "./gradlew --rerun-tasks replaceAppConf"
+
+        def dbName = getDatabaseNameForBuild()
+        sh "mysql -u root -e 'drop database IF EXISTS ${dbName}'"
+
+        def shopDbName = getShopDatabaseNameForBuild()
+        sh "mysql -u root -e 'drop database IF EXISTS ${shopDbName}'"
+
+        //sh "./gradlew integrationTest"
+        //step([$class: 'JUnitResultArchiver', testResults: 'sellercenter/build/logs/integration-test.xml'])
+        //sh "./gradlew stopWorkers || true"
+
+        sh "mysql -u root -e 'drop database IF EXISTS ${dbName}'"
+        sh "mysql -u root -e 'drop database IF EXISTS ${shopDbName}'"
+    */
+    }
+})
+
+def releaseTickets = []
+def buildInfo = ''
+node('php5') {
+  tmp = getTicketInfos()
+  releaseTickets = tmp[0]
+  buildInfo = tmp[1]
+  tmp = null
+}
+
+def stagingDeployTarget = ''
+def stagingDeployCommands = ''
+def listOfVentures = '[]'
+stage 'Staging'
+node('php5') {
+    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+
+    // Redirection of output because "cmd".execute().text apparently requires some kind of non-approvable permissions.
+    sh "python live/deploy_to_groovy.py --file live/deploy.yml --environment staging choice > choices.txt"
+    listOfVentures = readFile 'choices.txt'
+}
+
+// Prompt user for staging input
+def stagingUnoScript = new GroovyScript("return ${listOfVentures}", '')
+def stagingUserInput = input(
+    id: 'stagingUserInput', message: 'Which staging systems would you like to deploy to?', parameters: [
+    [
+     $class: 'TextParameterDefinition',
+     name: 'RC information',
+     description: 'List of build status, tickets and invalid commits',
+     defaultValue: buildInfo
+    ],
+    [
+     $class: 'BooleanParameterDefinition',
+     name: 'Skip staging deploy',
+     description: 'In case of emergency, you can skip staging deployment',
+     defaultValue: false
+    ],
+    [
+     $class: 'BooleanParameterDefinition',
+     name: 'Ignore deployability check',
+     description: 'In case of emergency, you can skip checking the release for deployability',
+     defaultValue: false
+    ],
+    [
+     $class: 'org.biouno.unochoice.ChoiceParameter',
+     name: 'STAGING_DEPLOY',
+     description: 'Staging environments to deploy to',
+     randomName: 'STAGING_DEPLOY_234234324',
+     visibleItemCount: 50,
+     script: stagingUnoScript,
+     choiceType: 'PT_MULTI_SELECT',
+     filterable: true
+    ]
+])
+node('php5') {
+    if (!stagingUserInput['Skip staging deploy']) {
+      if (!releaseTickets.qa_releasable && !stagingUserInput['Ignore deployability check']) {
+          error 'This release is not staging releasable! Check ticket statuses and try again later.'
+      }
+      checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+      stagingDeployTarget = stagingUserInput['STAGING_DEPLOY'].replaceAll(/[^a-z0-9\-,]/, '')
+      if (stagingDeployTarget )
+      println "Sanitized staging deploy target: ${stagingDeployTarget}"
+      sh "python live/deploy_to_groovy.py --file live/deploy.yml --environment staging --parallelism ${deployParallelism} --systems ${stagingDeployTarget} deploy > deploy_commands.txt 2>/dev/null"
+
+      def stagingDeployCommandsText = readFile 'deploy_commands.txt'
+      stagingDeployCommands = parseJson(stagingDeployCommandsText)
+      stagingDeployCommands = JsonOutput.toJson(commandsToSimpleMap(stagingDeployCommands))
+      println "Staging deploy commands after serialization: ${stagingDeployCommands}"
+   }
+}
+
+/**
+ * Unstash release package and transfer it to repository.sellercenter.net using SFTP
+ */
+def s3PackageLink = ''
+def packageChecksum = ''
+node('php5') {
+    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+    unstash "package"
+    sh "ls -la"
+
+    println "Copying package to repository..."
+    sshagent(credentials: ['scdeploy-ssh']) {
+         sh 'echo SSH_AUTH_SOCK=$SSH_AUTH_SOCK'
+         sh 'ls -al $SSH_AUTH_SOCK || true'
+         sh "echo cd repository > copy-package.txt"
+         sh "echo put ${buildArtifactName} >> copy-package.txt"
+         sh "echo bye >> copy-package.txt"
+         sh "sftp -oStrictHostKeyChecking=no -b copy-package.txt repo@repository.sellercenter.net"
+    }
+
+    println "Uploading package to S3..."
+    step([$class: 'S3BucketPublisher',
+      dontWaitForConcurrentBuildCompletion: false,
+      entries: [[
+        bucket: 'sc-release-packages',
+        excludedFile: '',
+        flatten: false,
+        gzipFiles: false,
+        keepForever: false,
+        managedArtifacts: false,
+        noUploadOnFailure: false,
+        selectedRegion: 'eu-central-1',
+        sourceFile: buildArtifactName,
+        storageClass: 'STANDARD',
+        uploadFromSlave: true,
+        useServerSideEncryption: false]],
+      profileName: 'sc-release-repository',
+      userMetadata: []]
+    )
+
+    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'sc-release-repository-ro',
+                      usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+        sh "python live/deploy_to_groovy.py --file live/deploy.yml --aws-key '${USERNAME}' --aws-secret '${PASSWORD}' --s3-bucket='sc-release-packages' --s3-file='${buildArtifactName}' s3link > s3_link.txt"
+    }
+    s3PackageLink = readFile 's3_link.txt'
+    println "Downloadable signed link: ${s3PackageLink}"
+
+    sh "md5sum ${buildArtifactName} | awk '{ print \$1 }' > checksum.txt"
+    packageChecksum = readFile 'checksum.txt'
+    packageChecksum = packageChecksum.trim()
+}
+
+def failedStagingDeployments = []
+node('php5') {
+    def parallelDeploy = [:]
+    if (stagingDeployCommands != '') {
+      stagingDeployCommands = parseJson(stagingDeployCommands)
+    } else {
+      stagingDeployCommands = []
+    }
+
+    println "Building commands for staging deployment"
+    // What we basically do here is process the map-based staging command list
+    // to a more traditional index-based list, otherwise we leak unserializable variables
+    def commandsList = []
+    for (int i = 0; i < stagingDeployCommands.size(); i++) {
+        if (stagingDeployCommands.get(i).size() > 0) {
+         def tmpCommands = []
+         for (item in mapToList(stagingDeployCommands.get(i))) {
+            tmpCommands.add([item[0], getDeployCommand(item[1], "${buildArtifactName}", s3PackageLink, packageChecksum).toString()])
+         }
+         commandsList.add(tmpCommands)
+     }
+    }
+    stagingDeployCommands = null
+
+    for (int i = 0; i < commandsList.size(); i++) {
+        if (commandsList.get(i).size() > 0) {
+         def loop = i
+         parallelDeploy["deploy-${loop}"] = {
+          def commands = commandsList.get(loop)
+          def targets = ''
+          for (int x = 0; x < commands.size(); x++) {
+              if (targets != '') {
+                 targets += ', '
+              }
+              targets += commands[x][0]
+          }
+          println "Parallel deployment ${loop} will deploy following systems: ${targets}"
+          node('php5') {
+                   checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+
+                       println "Fixing SSH configuration..."
+                       fixSshConfig("ssh/config")
+
+                   for (int o = 0; o < commands.size(); o++) {
+                       def target = commands[o][0]
+                   def cmd = commands[o][1]
+                   println "Now deploying on ${target}: ${cmd}"
+                           sshagent(credentials: ['scdeploy-ssh']) {
+                               sh 'echo SSH_AUTH_SOCK=$SSH_AUTH_SOCK'
+                               sh 'ls -al $SSH_AUTH_SOCK || true'
+                               def retcode = sh script: cmd, returnStatus: true
+                   if (retcode != 0) {
+                      failedStagingDeployments.add(target)
+                   }
+                           }
+                   println "Deploy completed on ${target}."
+               }
+          }
+         }
+        }
+    }
+    parallel parallelDeploy
+    // Avoid leakage of unserializable local variables
+    parallelDeploy = null
+}
+
+stage 'Staging QA'
+node('php5') {
+    if (!stagingUserInput['Skip staging deploy']) {
+      checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+
+      withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'sellercenter-staging-basicauth',
+                        usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+          sh "python live/deploy_to_groovy.py --file live/deploy.yml --environment staging --systems ${stagingDeployTarget} --auth ${env.USERNAME}:${env.PASSWORD} qa > staging_urls.txt"
+      }
+      def listOfDeployedStagingInstancesText = readFile 'staging_urls.txt'
+      def listOfDeployedStagingInstances = parseJson(listOfDeployedStagingInstancesText)
+
+      def numberOfFailedDeployments = 0
+      def numberOfSucceededDeployments = 0
+      def failedDeployments = ''
+      def succeededDeployments = ''
+      print listOfDeployedStagingInstances
+      for (item in mapToList(listOfDeployedStagingInstances)) {
+        if (!item[1].ok) {
+          println "Failed deployment to: ${item[0]}"
+          if (failedDeployments != '') {
+            failedDeployments += ', ';
+          }
+          failedDeployments += item[0];
+          numberOfFailedDeployments += 1;
+        } else {
+          if (!failedStagingDeployments.contains(item[0])) {
+            if (succeededDeployments != '') {
+              succeededDeployments += ', ';
+            }
+            succeededDeployments += item[0];
+            numberOfSucceededDeployments += 1;
+          }
+        }
+      }
+      for (item in failedStagingDeployments) {
+       if (failedDeployments != '') {
+          failedDeployments += ', ';
+       }
+       failedDeployments += item;
+      }
+      def slackMessage = ":star: New RC [${RC_TO_BUILD}] deployed on *STAGING* systems, refer to https://release.sellercenter.net/index.php?filter=prod for details :star:\n> *Successful deployments:* ${succeededDeployments}"
+      def slackMessageColor = 'good'
+      if (failedDeployments != '') {
+         slackMessage += "\n> *Failed deployments:* ${failedDeployments}"
+         slackMessageColor = 'danger'
+      }
+      withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'slack-token',
+                      usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+        slackSend channel: '#qa_release', color: slackMessageColor, message: slackMessage, teamDomain: "${USERNAME}", token: "${PASSWORD}"
+      }
+      if (numberOfSucceededDeployments > numberOfFailedDeployments) {
+
+        listOfDeployedStagingInstances = null
+        println "Moving ticket statuses from Ready for Release to Resolved"
+
+        checkout scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${RC_TO_BUILD}"]], extensions: [[$class: 'CloneOption', depth: 0, noTags: false, reference: '/vagrant/shared/TML', shallow: false]], userRemoteConfigs: [[credentialsId: '26454ce6-0cdb-4dac-8de0-75195f37ddfc', url: 'https://github.com/rocket-internet-berlin/TML.git']]]
+
+        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'f63d873b-49c5-4a1d-99a9-0fa4140db907',
+                        usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+          sh "python sellercenter/tools/scDeployTool.py --url=https://jira.rocket-internet.de/ --username='${env.USERNAME}' --password='${env.PASSWORD}' --branch='${RC_TO_BUILD}' --mode=jira --status-from 'Ready for Release' --status-to='Resolved'"
+        }
+      }
+
+      if (failedDeployments != '') {
+        if (numberOfSucceededDeployments > numberOfFailedDeployments) {
+          println "**************************************************************************"
+          println "Some deployments failed, check log for more details: ${failedDeployments}"
+          println "**************************************************************************"
+        } else {
+          error "Some deployments failed, check log for more details: ${failedDeployments}"
+        }
+      } else {
+         echo "All deployments verified successfully."
+      }
+   } else {
+      println "Skipped staging deployment"
+   }
+}
+
+stage 'Live'
+def liveDeployTarget = ''
+def liveDeployCommands = []
+node('php5') {
+    println "Read venture choices..."
+
+    // Redirection of output because "cmd".execute().text apparently requires some kind of non-approvable permissions.
+    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+    sh "python live/deploy_to_groovy.py --file live/deploy.yml --environment live choice > choices.txt"
+    listOfVentures = readFile 'choices.txt'
+}
+def liveUnoScript = new GroovyScript("return ${listOfVentures}", '')
+def liveUserInput = input(
+    id: 'liveUserInput', message: 'Which live systems would you like to deploy to?', parameters: [
+    [
+     $class: 'org.biouno.unochoice.ChoiceParameter',
+     name: 'LIVE_DEPLOY',
+     description: 'Live environments to deploy to',
+     randomName: 'LIVE_DEPLOY_234234324',
+     visibleItemCount: 50,
+     script: liveUnoScript,
+     choiceType: 'PT_MULTI_SELECT',
+     filterable: true
+    ]
+])
+
+node('php5') {
+    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+
+    liveDeployTarget = liveUserInput.replaceAll(/[^a-z0-9\-,]/, '')
+    println "Sanitized livedeploytarget: ${liveDeployTarget}"
+    if (liveDeployTarget != '') {
+      sh "python live/deploy_to_groovy.py --file live/deploy.yml --environment live --parallelism ${deployParallelism} --systems ${liveDeployTarget} deploy > deploy_commands.txt"
+      def liveDeployCommandsText = readFile 'deploy_commands.txt'
+      liveDeployCommands = parseJson(liveDeployCommandsText)
+      liveDeployCommands = JsonOutput.toJson(commandsToSimpleMap(liveDeployCommands))
+      println "LIVE deploy commands after serialization: ${liveDeployCommands}"
+    } else {
+      liveDeployCommands = ''
+    }
+}
+
+def failedLiveDeployments = []
+node('php5') {
+    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+
+    tmp = getTicketInfos()
+    releaseTickets = tmp[0]
+    buildInfo = tmp[1]
+    tmp = null
+
+    def parallelDeploy = [:]
+    liveDeployCommands = parseJson(liveDeployCommands)
+    if (liveDeployCommands.size() > 0) {
+
+      if (!releaseTickets.live_releasable) {
+          error 'This release is not live releasable! Check ticket statuses.'
+      }
+
+      println "Building commands for LIVE deployment"
+      // What we basically do here is process the map-based staging command list
+      // to a more traditional index-based list, otherwise we leak unserializable variables
+      def commandsList = []
+      for (int i = 0; i < liveDeployCommands.size(); i++) {
+          if (liveDeployCommands.get(i).size() > 0) {
+           def tmpCommands = []
+           for (item in mapToList(liveDeployCommands.get(i))) {
+              tmpCommands.add([item[0], getDeployCommand(item[1], "${buildArtifactName}", s3PackageLink, packageChecksum).toString()])
+           }
+           commandsList.add(tmpCommands)
+       }
+      }
+      liveDeployCommands = null
+
+      for (int i = 0; i < commandsList.size(); i++) {
+          if (commandsList.get(i).size() > 0) {
+           def loop = i
+           parallelDeploy["deploy-${loop}"] = {
+                println "Building commands for parallel process ${loop}"
+            def commands = commandsList.get(loop)
+            println commands
+            node('php5') {
+                     checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+
+                         println "Fixing SSH configuration..."
+                         fixSshConfig("ssh/config")
+
+                 println "Parallel LIVE deploy ${i} starting..."
+                     for (int o = 0; o < commands.size(); o++) {
+                         def target = commands[o][0]
+                     def cmd = commands[o][1]
+                     println "Now deploying LIVE on ${target}: ${cmd}"
+                             sshagent(credentials: ['scdeploy-ssh']) {
+                                 sh 'echo SSH_AUTH_SOCK=$SSH_AUTH_SOCK'
+                                 sh 'ls -al $SSH_AUTH_SOCK || true'
+                                 def retcode = sh script: cmd, returnStatus: true
+                     if (retcode != 0) {
+                        failedLiveDeployments.add(target)
+                     }
+                             }
+                     println "LIVE deploy completed on ${target}."
+                 }
+            }
+           }
+          }
+      }
+      parallel parallelDeploy
+    } else {
+      println "Nowhere to deploy for live, skipping..."
+      liveDeployCommands = null
+    }
+    // Avoid leakage of unserializable local variables
+    parallelDeploy = null
+}
+
+stage 'Live QA'
+node('php5') {
+    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'cef5d6af-ce51-4042-bfcf-1cc5904fb070', url: 'git@git.sellercenter.net:sellercenter/deploy.git']]]
+
+    if (liveDeployTarget != '') {
+
+      withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'sellercenter-staging-basicauth',
+                        usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+          sh "python live/deploy_to_groovy.py --file live/deploy.yml --environment live --systems ${liveDeployTarget} --auth ${env.USERNAME}:${env.PASSWORD} qa > live_urls.txt"
+      }
+      def listOfDeployedLiveInstancesText = readFile 'live_urls.txt'
+      def listOfDeployedLiveInstances = parseJson(listOfDeployedLiveInstancesText)
+
+      def failedDeployments = ''
+      def succeededLiveDeployments = ''
+      print listOfDeployedLiveInstances
+      for (item in mapToList(listOfDeployedLiveInstances)) {
+        if (!item[1].ok) {
+       println "Failed LIVE deployment to: ${item[0]}"
+       if (failedDeployments != '') {
+          failedDeployments += ', ';
+       }
+       failedDeployments += item[0];
+        } else {
+           if (!failedLiveDeployments.contains(item[0])) {
+         if (succeededLiveDeployments != '') {
+            succeededLiveDeployments += ', ';
+         }
+         succeededLiveDeployments += item[0];
+       }
+        }
+      }
+
+      def slackMessage = ":star: New RC [${RC_TO_BUILD}] deployed on *LIVE* systems, refer to https://release.sellercenter.net/index.php?filter=prod for details :star:\n> *Successful deployments:* ${succeededLiveDeployments}"
+      def slackMessageColor = 'good'
+      if (failedDeployments != '') {
+         slackMessage += "\n> *Failed deployments:* ${failedDeployments}"
+         slackMessageColor = 'danger'
+      }
+      withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'slack-token',
+                      usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+        slackSend channel: '#qa_release', color: slackMessageColor, message: slackMessage, teamDomain: "${USERNAME}", token: "${PASSWORD}"
+      }
+
+      if (failedDeployments != '') {
+         error "Some LIVE deployments failed, check log for more details: ${failedDeployments} !!!"
+      } else {
+         echo "All LIVE deployments verified successfully."
+      }
+
+      checkout scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${RC_TO_BUILD}"]], extensions: [[$class: 'CloneOption', depth: 0, noTags: false, reference: '/vagrant/shared/TML', shallow: false]], userRemoteConfigs: [[credentialsId: '26454ce6-0cdb-4dac-8de0-75195f37ddfc', url: 'https://github.com/rocket-internet-berlin/TML.git']]]
+
+      println "Moving ticket statuses from Resolved to Closed and adding labels"
+      withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'f63d873b-49c5-4a1d-99a9-0fa4140db907',
+                         usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+          sh "python sellercenter/tools/scDeployTool.py --url=https://jira.rocket-internet.de/ --username='${env.USERNAME}' --password='${env.PASSWORD}' --branch='${RC_TO_BUILD}' --mode=jira --status-from='Resolved' --status-to='Closed'"
+          sh "python sellercenter/tools/scDeployTool.py --url=https://jira.rocket-internet.de/ --username='${env.USERNAME}' --password='${env.PASSWORD}' --branch='${RC_TO_BUILD}' --mode=jira --add-label='${RC_TO_BUILD}'"
+      }
+
+      listOfDeployedLiveInstances = null
+    }
+}
+
+// Helper functions start here
+
+def createTemporaryDirectory() {
+    println "Creating temporary directory for build under /tmp/${env.BUILD_TAG}"
+    sh "mkdir -p /tmp/${env.BUILD_TAG}/logs"
+    sh "mkdir -p /tmp/${env.BUILD_TAG}/filestorage"
+    sh "mkdir -p /tmp/${env.BUILD_TAG}/images"
+}
+
+def getDatabaseNameForBuild() {
+    return "sc_${env.BUILD_TAG}".replaceAll(/-/, "_")
+}
+def getShopDatabaseNameForBuild() {
+    return "shop_${env.BUILD_TAG}".replaceAll(/-/, "_")
+}
+
+def getDeployCommand(command, releasePackage, s3Link, packageChecksum) {
+  releasePackage = releasePackage.replaceAll(/.tar.gz$/, '')
+  command = command.replaceAll(/\$\{SSHPARAMS\}/, '-oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no -oServerAliveInterval=60 -oServerAliveCountMax=5 -oConnectTimeout=30 -t -t')
+  command = command.replaceAll(/\$\{SSHUSER\}/, 'scdeploy')
+  command = command.replaceAll(/\$\{PACKAGE\}/, releasePackage)
+  command = command.replaceAll(/\$\{S3LINK\}/, "'" + s3Link.trim() + "'")
+  command = command.replaceAll(/\$\{CHECKSUM\}/, packageChecksum.trim())
+  return command
+}
+
+@NonCPS
+def fixupSedFile(text, databaseName, shopDatabaseName) {
+    def replacer = [:]
+    def shopPortNumber = 21051 + env.BUILD_NUMBER.toInteger();
+    replacer.put("sellercenter.prefix", "${env.BUILD_TAG}".replaceAll("-", "_"))
+    replacer.put("sellercenter.logfiles.path", "/tmp/${env.BUILD_TAG}/logs/")
+    replacer.put("sellercenter.filestorage.export.path", "/tmp/${env.BUILD_TAG}/filestorage/")
+    replacer.put("sellercenter.catalog.image_directory", "/tmp/${env.BUILD_TAG}/images/")
+    replacer.put("sellercenter.db.dbname", databaseName)
+    replacer.put("shop.db.dbname", shopDatabaseName)
+    replacer.put("sellercenter.shop_update.status.http_port", shopPortNumber)
+
+    text = readFile(inFile)
+    for (item in replacer) {
+        text = text.replaceFirst(~"s\\|%${item.key}%\\|.*\\|g", "s|%${item.key}%|${item.value}|g")
+    }
+    writeFile file: inFile, text: text
+    text
+}
+
+def fixupRevTxt(revTxtFile, packageName, branchName) {
+    sh "sed -i 's/Branch: .*/Branch: ${branchName}/g' ${revTxtFile}"
+    sh "sed -i 's/Package: .*/Package: ${packageName}/g' ${revTxtFile}"
+}
+
+def setJUnitPackageName(packageName, inFile) {
+    // Prepend the testName as the package name so that we get sorted output in the
+    // Jenkins test results page. The packageName is extracted from the classname
+    // attribute of the testcase tag.
+    // WARNING: the package attribute of the testcase tag is igonred by Jenkins
+    sh "sed -i \"s/\\(classname=['\\\"]\\)/\\1${packageName}./g\" ${inFile}"
+}
+
+def getDeployerUsername() {
+    def buildUserName = 'jenkins'
+    wrap([$class: 'BuildUser']) {
+      buildUserName = "${env.BUILD_USER}".toLowerCase().replaceAll(/[^a-z]/, '')
+    }
+    return buildUserName
+}
+
+def fixSshConfig(fileName) {
+    sh "sed -i 's/ProxyCommand ssh /ProxyCommand ssh -oConnectTimeout=30 -oServerAliveInterval=10 -oServerAliveCountMax=6 -oUserKnownHostsFile=\\/dev\\/null -oStrictHostKeyChecking=no -l scdeploy /g' ${fileName}"
+    sh "cp -f ${fileName} ~/.ssh/config"
+    sh "chmod 0600 ~/.ssh/config"
+    sh "echo '' >> ~/.ssh/config"
+    sh "echo 'Host sc.* sqc.* jump.sellercenter.net' >> ~/.ssh/config"
+    sh "echo '  User scdeploy' >> ~/.ssh/config"
+}
+
+def getTicketInfos() {
+    def releaseTickets = []
+    checkout scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${RC_TO_BUILD}"]], extensions: [[$class: 'CloneOption', depth: 0, noTags: false, reference: '/vagrant/shared/TML', shallow: false]], userRemoteConfigs: [[credentialsId: '26454ce6-0cdb-4dac-8de0-75195f37ddfc', url: 'https://github.com/rocket-internet-berlin/TML.git']]]
+
+    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'f63d873b-49c5-4a1d-99a9-0fa4140db907',
+                       usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+        sh "python sellercenter/tools/scDeployTool.py --url=https://jira.rocket-internet.de/ --username='${env.USERNAME}' --password='${env.PASSWORD}' --branch='${RC_TO_BUILD}' --mode=json > tickets.json 2>/dev/null"
+    }
+    def releaseTicketsJson = readFile 'tickets.json'
+    releaseTickets = parseJson(releaseTicketsJson)
+    buildInfo = 'Is releasable to staging: ' + (releaseTickets.qa_releasable ? 'Yes' : 'No') + '\n'
+    buildInfo += 'Is releasable to live: ' + (releaseTickets.live_releasable ? 'Yes' : 'No') + '\n'
+    buildInfo += '\n'
+
+    echo "Tickets in release:"
+    for (ticket in releaseTickets.tickets) {
+        buildInfo += ticket.number + ': ' + ticket.jira_summary + ' (' + ticket.jira_status + ', ' + ticket.authors.join(', ') + ')' + '\n'
+        echo "${ticket.number} (${ticket.jira_status}: ${ticket.jira_summary}: ${ticket.jira_link}"
+    }
+    buildInfo += '\n'
+    echo "Invalid commits in release:"
+    for (commit in releaseTickets.invalid_commits) {
+        echo "${commit.message}: ${commit.github_link}"
+        buildInfo += commit.message + ' (' + commit.authors.join(', ') + '): ' + commit.github_link
+    }
+    println buildInfo
+    return [releaseTickets, buildInfo]
+}
+
+@NonCPS
+def parseJson(jsonContents) {
+    def jsonSlurper = new JsonSlurperClassic()
+    def json = jsonSlurper.parseText(jsonContents)
+    return json
+}
+
+@NonCPS
+def commandsToSimpleMap(commands) {
+   def commandsMap = []
+   for (int i = 0; i < commands.size(); i++) {
+         if (commands.get(i).size() > 0) {
+        def tmpMap = [:]
+        for (item in commands.get(i)) {
+           tmpMap[item.key.toString()] = item.value.toString()
+        }
+        commandsMap << tmpMap
+    }
+    }
+    return commandsMap
+}
+
+@NonCPS
+def mapToList(depmap) {
+    def dlist = []
+    for (entry in depmap) {
+        dlist.add([entry.key, entry.value])
+    }
+    dlist
+}
+
+@NonCPS
+def buildDeployCommands(sourceCommands, buildArtifactName) {
+    def commands = []
+    for (item in sourceCommands) {
+    commands.add([item.key.toString(), getDeployCommand(item.value, "${buildArtifactName}").toString()])
+    }
+    commands
+}
+

@@ -1,0 +1,16 @@
+checkout scm: [$class: 'GitSCM',
+    branches: [[name: "refs/heads/${RC_TO_BUILD}"]],
+    extensions: [
+        [$class: 'CleanBeforeCheckout'],
+        [$class: 'CloneOption',
+          depth: 0, noTags: false,
+          reference: '/vagrant/shared/TML',
+          shallow: false]
+    ],
+    userRemoteConfigs: [
+      [credentialsId: '26454ce6-0cdb-4dac-8de0-75195f37ddfc',
+      url: 'https://github.com/rocket-internet-berlin/TML.git']
+    ]
+]
+
+// https://support.cloudbees.com/hc/en-us/articles/226122247-How-to-Customize-Checkout-for-Pipeline-Multibranch

@@ -1,0 +1,138 @@
+#!groovy
+
+pipeline {
+    agent { label 'swarm' }
+    options { timeout(time: 300, unit: 'SECONDS') }
+    //parameters {
+    //    booleanParam(name: 'deploy_staging',
+    //    defaultValue: false,
+    //    description: 'Would you like to deploy to stging?')
+    //}
+    stages {
+
+        stage('build') {
+            steps {
+                sh 'chat_service/build.sh'
+                archiveArtifacts 'chat_service/target/surefire-reports/*'
+                archiveArtifacts 'chat_service/target/*.jar'
+                stash includes: 'chat_service/target/*.jar', name: 'chat_service_app'
+            }
+            post {
+                always {
+                    junit 'chat_service/target/surefire-reports/*.xml'
+                }
+                //failure {
+                //    mail to: xxx@xxx.com, subject: 'The Pipeline failed :('
+                //}
+            }
+        }
+
+        stage('test') {
+            steps {
+                parallel debian: {
+                        withDockerContainer('debian') {
+                            sh 'cat /etc/*rele*'
+                            unstash 'chat_service_app'
+                            sh 'hostname; pwd; ls -laFh; sleep 120'
+                        }
+                        //node('debian') {
+                            //script {}
+                            //checkout scm
+                            //try {
+                                //unstash 'chat_service_app'
+                            //    sh 'cat /etc/*rele*'
+                            //} catch (err) {
+                            //    echo "Failed: ${err}"
+                            //} //finally {
+                            //    junit '**/target/*.xml'
+                            //}
+                        //}
+                    },
+                    centos: {
+                        withDockerContainer('centos') {
+                            sh 'cat /etc/*rele*'
+                        }
+                        //node('centos') {
+                        //    sh 'cat /etc/*rele*'
+                        //}
+                    }
+            }
+        }
+
+        stage('staging deployment') {
+
+            /*def stagingUserInput = input(
+                id: 'stagingUserInput',
+                message: 'Would you like to deploy to stging?',
+                parameters: [
+                    [
+                     $class: 'BooleanParameterDefinition',
+                     name: 'Deploy',
+                     description: 'Start staging deployment',
+                     defaultValue: false
+                    ]
+                ]
+            )
+            if (stagingUserInput['Deploy']) {*/
+
+            //when {
+            //    expression {
+            //        params.deploy_staging == true
+            //    }
+            //}
+            // when { branch 'master' }
+
+            steps {
+                input(message: 'Would you like to deploy to staging?')
+                sh 'echo deploy to staging completed'
+            }
+        }
+
+        stage('staging QA') {
+
+            steps {
+                input(message: 'Would you like to QA staging?')
+                sh 'echo QA staging completed'
+            }
+        }
+
+        /*node {
+          try {
+              def nodeUserInput = input(
+                  id: 'nodeUserInput',
+                  message: 'Would you like to deploy to xxx?',
+                  parameters: [
+                      [
+                       $class: 'BooleanParameterDefinition',
+                       name: 'Deploy',
+                       description: 'Start xxx deployment',
+                       defaultValue: false
+                      ]
+                  ]
+              )
+              echo 'Succeeded!'
+              echo "nodeUserInput = ${nodeUserInput}"
+          } catch (err) {
+              echo "Failed: ${err}"
+          } finally {
+              echo 'finally!'
+          }
+        }*/
+
+        stage('LIVE deployment') {
+
+            steps {
+                input(message: 'Would you like to deploy to LIVE?')
+                sh 'echo deploy to live completed'
+            }
+        }
+
+        stage('LIVE QA') {
+
+            steps {
+                input(message: 'Would you like to QA LIVE?')
+                sh 'echo QA LIVE completed'
+            }
+        }
+    }
+}
