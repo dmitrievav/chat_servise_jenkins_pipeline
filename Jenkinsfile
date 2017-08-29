@@ -5,7 +5,7 @@ stage('build') {
         // https://support.cloudbees.com/hc/en-us/articles/226122247-How-to-Customize-Checkout-for-Pipeline-Multibranch
         checkout scm
         sh 'hostname; pwd; ls -laFh; env'
-        sh 'git br; git st; git hist-all | head'
+        sh 'git branch; git status; git log --pretty=format:\"%h %ad | %s%d [%an]\" --graph --date=short --all | head'
         sh 'chat_service/build.sh'
         archiveArtifacts 'chat_service/target/surefire-reports/*'
         archiveArtifacts 'chat_service/target/*.jar'
@@ -14,7 +14,7 @@ stage('build') {
     }
 }
 
-/*stage('test') {
+stage('test') {
     node('swarm') {
         parallel debian: {
                 withDockerContainer('debian') {
@@ -31,7 +31,7 @@ stage('build') {
                 }
             }
     }
-}*/
+}
 
 stage('staging deployment') {
     timeout(time: 60, unit: 'SECONDS') {
